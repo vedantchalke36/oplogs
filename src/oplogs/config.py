@@ -54,12 +54,13 @@ def write_daemon_info(info: DaemonInfo) -> None:
 def clear_daemon_info() -> None:
     """Remove daemon.json only when it describes this process.
 
-    Concurrent daemons can overwrite the info file; an exiting daemon must not
-    unlink the newer daemon's record. A tiny check-then-unlink window remains
-    (the file can be replaced between the read and the unlink); closing it would
-    need cross-process locking, which is disproportionate for a single-user
-    daemon. This still removes the common failure where a stale daemon deletes
-    a live daemon's record.
+    This is a **mitigation**, not a complete fix: concurrent daemons can
+    overwrite the info file, and an exiting daemon must not unlink the newer
+    daemon's record. The PID check eliminates the common failure where a stale
+    daemon deletes a live daemon's record. A tiny check-then-unlink window
+    remains (the file can be replaced between the read and the unlink);
+    closing it fully would need cross-process locking, which is
+    disproportionate for a single-user daemon.
     """
     target = daemon_file()
     if not target.exists():

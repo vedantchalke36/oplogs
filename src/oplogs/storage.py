@@ -350,18 +350,36 @@ class Storage:
         from the manifest if the index is gone, and appends the events so a run
         that finished during an outage is never silently lost. Events that fail
         validation or artifact expansion are skipped, never the whole spool.
+
+        The rotated file is treated as the durable acknowledgement boundary: it
+        is only removed after ``append_events`` commits successfully so that a
+        crash mid-ingestion can be retried on the next startup.  When both
+        ``spool.pending`` (from a previous incomplete replay) and a newer
+        ``spool.jsonl`` exist, the older pending file is processed first so that
+        unacknowledged events are never overwritten.
         """
         ingested = 0
         for run_path in sorted(self.runs_dir.iterdir()):
             if not run_path.is_dir():
                 continue
+            run_id = run_path.name
             spool = run_path / "spool.jsonl"
-            rotated = run_path / "spool.pending"
-            if rotated.exists() and not spool.exists():
-                rotated.replace(spool)
+            pending = run_path / "spool.pending"
+            replaying = run_path / "spool.replaying"
+
+            # A previous replay was interrupted — finish it first.
+            if replaying.exists():
+                ingested += self._ingest_spool_file(run_id, replaying)
+
+            # Process any leftover pending file from an earlier cycle before
+            # rotating the current spool so older unacknowledged events are
+            # never overwritten by newer ones.
+            if pending.exists() and not replaying.exists():
+                ingested += self._ingest_spool_file(run_id, pending)
+
             if not spool.exists():
                 continue
-            run_id = run_path.name
+
             if not self.get_run(run_id):
                 manifest_path = run_path / "manifest.json"
                 if not manifest_path.exists():
@@ -372,34 +390,54 @@ class Storage:
                     )
                 except (KeyError, TypeError, json.JSONDecodeError):
                     continue
+
+            # Rotate the live spool into a durable intermediate state.
+            # ``spool.replaying`` survives crashes so the next startup can
+            # retry if ingestion does not commit.
             try:
-                spool.replace(rotated)
+                spool.replace(replaying)
             except OSError:
                 continue
-            events: list[Event] = []
-            try:
-                lines = rotated.read_text(encoding="utf-8").splitlines()
-            finally:
-                rotated.unlink(missing_ok=True)
-            for line in lines:
-                if not line:
-                    continue
-                try:
-                    raw = json.loads(line)
-                    raw["run_id"] = run_id
-                    event = Event.from_dict(raw) if raw.get("checksum") else Event(**raw).seal()
-                    if event.kind in {"artifact", "media"}:
-                        self._expand_artifacts(event)
-                    events.append(event)
-                except (ValueError, TypeError, OSError, json.JSONDecodeError):
-                    continue
-            if not events:
-                continue
-            try:
-                ingested += self.append_events(events)
-            except (ValueError, TypeError, sqlite3.Error):
-                continue
+
+            ingested += self._ingest_spool_file(run_id, replaying)
+
         return ingested
+
+    def _ingest_spool_file(self, run_id: str, path: Path) -> int:
+        """Parse, expand, and journal one spool file.
+
+        The file is only removed after ``append_events`` commits so that a
+        crash mid-ingestion leaves the file for the next startup to retry.
+        """
+        events: list[Event] = []
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return 0
+        for line in lines:
+            if not line:
+                continue
+            try:
+                raw = json.loads(line)
+                raw["run_id"] = run_id
+                event = Event.from_dict(raw) if raw.get("checksum") else Event(**raw).seal()
+                if event.kind in {"artifact", "media"}:
+                    self._expand_artifacts(event)
+                events.append(event)
+            except (ValueError, TypeError, OSError, json.JSONDecodeError):
+                continue
+        if not events:
+            # Nothing to ingest — safe to remove the empty/stale file.
+            path.unlink(missing_ok=True)
+            return 0
+        try:
+            accepted = self.append_events(events)
+        except (ValueError, TypeError, sqlite3.Error):
+            # Ingestion failed; leave the file so the next startup retries.
+            return 0
+        # Only remove the spool file after durable commit.
+        path.unlink(missing_ok=True)
+        return accepted
 
     def _index_event(self, connection: sqlite3.Connection, event: Event) -> None:
         connection.execute(

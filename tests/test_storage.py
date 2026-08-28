@@ -223,3 +223,62 @@ def test_add_artifact_returns_persisted_record_on_id_conflict(
     assert len(store.artifacts(run.id)) == 1
     assert second["digest"] == first["digest"]
     assert second["digest"] == store.artifacts(run.id)[0]["digest"]
+
+
+def test_replay_spools_retains_file_until_ingestion_succeeds(
+    store: Storage, tmp_path: Path
+) -> None:
+    """Spool file survives a failed ingestion so the next startup retries."""
+    run = store.create_run("durability", run_id="crash-recovery")
+    event = Event(run.id, 0, "metric", {"values": {"loss": 0.7}}).to_dict()
+    spool = store.runs_dir / run.id / "spool.jsonl"
+    spool.write_text(json.dumps(event, separators=(",", ":")) + "\n")
+
+    # Simulate a crash after rotation but before append_events commits:
+    # manually move the spool into the replaying state, then corrupt the
+    # store so append_events raises.
+    replaying = store.runs_dir / run.id / "spool.replaying"
+    spool.replace(replaying)
+    assert replaying.exists()
+
+    # Corrupt the database so append_events fails.
+    store.database_path.write_bytes(b"not-a-sqlite-db")
+
+    ingested = store.replay_spools()
+    assert ingested == 0
+    # The replaying file must still exist so the next startup can retry.
+    assert replaying.exists()
+
+    # Repair the database and retry — the events should now be ingested.
+    store.database_path.unlink()
+    Path(f"{store.database_path}-wal").unlink(missing_ok=True)
+    Path(f"{store.database_path}-shm").unlink(missing_ok=True)
+    recovered = Storage(store.root)
+    recovered.create_run("durability", run_id="crash-recovery")
+    ingested = recovered.replay_spools()
+    assert ingested == 1
+    assert not replaying.exists()
+    assert recovered.history(run.id)["loss"][0]["value"] == 0.7
+
+
+def test_replay_spools_preserves_both_pending_and_current_spool(
+    store: Storage, tmp_path: Path
+) -> None:
+    """When both spool.pending and spool.jsonl exist, both sets survive."""
+    run = store.create_run("durability", run_id="dual-spool")
+    old_event = Event(run.id, 0, "metric", {"values": {"loss": 1.0}}).to_dict()
+    new_event = Event(run.id, 1, "metric", {"values": {"loss": 0.5}}).to_dict()
+
+    pending = store.runs_dir / run.id / "spool.pending"
+    spool = store.runs_dir / run.id / "spool.jsonl"
+    pending.write_text(json.dumps(old_event, separators=(",", ":")) + "\n")
+    spool.write_text(json.dumps(new_event, separators=(",", ":")) + "\n")
+
+    ingested = store.replay_spools()
+    assert ingested == 2
+    assert not pending.exists()
+    assert not spool.exists()
+    history = store.history(run.id)
+    assert len(history["loss"]) == 2
+    values = sorted(point["value"] for point in history["loss"])
+    assert values == [0.5, 1.0]
